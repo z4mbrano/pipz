@@ -8,6 +8,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    
     steps:
       - name: Checkout código
         uses: actions/checkout@v4
@@ -18,9 +19,10 @@ jobs:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
       - name: Iniciar Cloud SQL Proxy
-        uses: google-github-actions/setup-cloudsql-connect@v2 # Versão v2 é a correta
+        # Mudamos de @v2 para @v1 (esta é a versão correta existente)
+        uses: google-github-actions/setup-cloudsql-connect@v1 
         with:
-          instance_connection_name: "caldeira-lake:southamerica-east1:banco-de-dados-caldeira-campus" # Ver passo abaixo
+          instance_connection_name: "caldeira-lake:southamerica-east1:banco-de-dados-caldeira-campus"
 
       - name: Instalar Python
         uses: actions/setup-python@v5
@@ -28,7 +30,7 @@ jobs:
           python-version: '3.11'
 
       - name: Instalar Dependências
-        run: pip install -r requirements.txt
+        run: pip install requests pandas sqlalchemy pg8000 psycopg2-binary
 
       - name: Executar Script
         env:
