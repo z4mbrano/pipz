@@ -44,8 +44,8 @@ def fetch_pipz(list_id):
     return contacts
 
 def process():
-    if not DB_URL or not PIPZ_TOKEN:
-        print("ERRO: As variáveis PIPZ_TOKEN ou DB_URL não foram configuradas nos Secrets!")
+    if not DB_URL or not PIPZ_KEY or not PIPZ_SECRET:
+        print("ERRO: As variáveis PIPZ_KEY, PIPZ_SECRET ou DB_URL não foram configuradas nos Secrets!")
         return
 
     try:
