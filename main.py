@@ -54,7 +54,7 @@ def extract_all_fields(contact):
 def fetch_pipz(list_id):
     """Busca 20 contatos com os parâmetros de extração corretos"""
     params = {
-        "list_id": list_id, "limit": "20", 
+        "list_id": list_id, "limit": "200", 
         "extra_fields": "true", # Usando string 'true' que é comum na v1
         "include_fieldsets": "true",
         "api_key": PIPZ_KEY, "api_secret": PIPZ_SECRET
