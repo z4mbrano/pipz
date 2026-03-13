@@ -12,14 +12,15 @@ PIPZ_SECRET = os.getenv("PIPZ_SECRET")
 DB_URL = os.getenv("DB_URL")
 
 def format_date_to_db(date_str):
-    """Converte ISO (2010-04-25T...) ou PT-BR (25/04/2010) para YYYY-MM-DD"""
+    """Trata formatos ISO (2010-04-25T...) e PT-BR (25/04/2010)"""
     if not date_str or str(date_str).lower() in ["none", "null", ""]: return None
-    date_str = str(date_str).split("T")[0].split(" ")[0].replace("-", "/")
+    # Remove o T e o Z de formatos ISO
+    clean = str(date_str).replace("T", " ").replace("Z", "").split(" ")[0]
+    clean = clean.replace("-", "/")
     
-    # Tenta formatos comuns
     for fmt in ("%Y/%m/%d", "%d/%m/%Y"):
         try:
-            return datetime.strptime(date_str, fmt).strftime("%Y-%m-%d")
+            return datetime.strptime(clean, fmt).strftime("%Y-%m-%d")
         except: continue
     return None
 
@@ -29,46 +30,53 @@ def clean_cpf(cpf_str):
     return nums if len(nums) >= 11 else None
 
 def extract_all_fields(contact):
-    """Varre o JSON inteiro do Pipz procurando por campos customizados"""
+    """Varre fieldsets e campos customizados de forma profunda"""
     data = {}
-    # 1. Pega campos da raiz
+    # 1. Campos da Raiz
     for k, v in contact.items():
         if not isinstance(v, (dict, list)):
             data[k] = v
 
-    # 2. Varre fieldsets de forma exaustiva (seja lista ou dicionário)
-    fs_data = contact.get('fieldsets', {})
-    fs_list = fs_data.values() if isinstance(fs_data, dict) else fs_data if isinstance(fs_data, list) else []
-    
-    for fs in fs_list:
-        if isinstance(fs, dict):
-            # Procura na lista de 'fields'
-            for field in fs.get('fields', []):
-                label = field.get('label')
-                name = field.get('name')
-                val = field.get('value')
-                if label: data[label.strip()] = val
-                if name: data[name.strip()] = val
+    # 2. Varre fieldsets (Pipz v1 pode enviar como lista ou dicionário)
+    fs_data = contact.get('fieldsets')
+    if fs_data:
+        fs_list = fs_data.values() if isinstance(fs_data, dict) else fs_data if isinstance(fs_data, list) else []
+        for fs in fs_list:
+            if isinstance(fs, dict):
+                for field in fs.get('fields', []):
+                    label = field.get('label', '').strip()
+                    name = field.get('name', '').strip()
+                    val = field.get('value')
+                    if label: data[label] = val
+                    if name: data[name] = val
     return data
 
 def fetch_pipz(list_id):
-    """Busca 20 contatos com os parâmetros de extração corretos"""
+    """Busca contatos usando inteiros (1) para extra_fields, conforme padrão Pipz"""
     params = {
-        "list_id": list_id, "limit": "200", 
-        "extra_fields": "true", # Usando string 'true' que é comum na v1
-        "include_fieldsets": "true",
-        "api_key": PIPZ_KEY, "api_secret": PIPZ_SECRET
+        "list_id": list_id, 
+        "limit": 50, 
+        "extra_fields": 1, 
+        "include_fieldsets": 1,
+        "api_key": PIPZ_KEY, 
+        "api_secret": PIPZ_SECRET
     }
     url = "https://campuscaldeira.pipz.io/api/v1/contact/"
-    res = requests.get(url, params=params, headers={"Accept": "application/json"})
-    return res.json().get('objects', []) if res.status_code == 200 else []
+    try:
+        res = requests.get(url, params=params, headers={"Accept": "application/json"}, timeout=30)
+        if res.status_code == 200:
+            return res.json().get('objects', [])
+        print(f"Erro na Lista {list_id}: {res.status_code}")
+    except Exception as e:
+        print(f"Falha na requisição: {e}")
+    return []
 
 def process():
     if not DB_URL: return
     engine = create_engine(DB_URL)
     
     with engine.begin() as conn:
-        print("--- CONEXÃO ESTABELECIDA ---")
+        print("--- INICIANDO CONEXÃO ---")
         
         for list_id in ["141", "144"]:
             contacts = fetch_pipz(list_id)
@@ -77,9 +85,11 @@ def process():
             for c in contacts:
                 f = extract_all_fields(c)
                 
-                # --- MAPEAMENTO PESSOAS (Usando seus nomes exatos da lista) ---
-                # Procura CPF em todos os lugares possíveis citados por você
-                raw_cpf = f.get("CPF") or f.get("[2025] CPF") or f.get("gc_2026_lp1_cpf") or f.get("gc_2026_lp2_cpf")
+                # --- MAPEAMENTO CPF (Múltiplas tentativas baseadas na sua lista) ---
+                raw_cpf = (f.get("CPF") or f.get("[2025] CPF") or 
+                           f.get("gc_2026_lp1_cpf") or f.get("gc_2026_lp2_cpf") or 
+                           f.get("cpf"))
+                
                 cpf_limpo = clean_cpf(raw_cpf)
                 final_cpf = cpf_limpo if cpf_limpo else f"ID_{c.get('id')}"
                 
@@ -101,7 +111,7 @@ def process():
                 })
                 pessoa_id = p_res.fetchone()[0]
 
-                # --- MAPEAMENTO LP1 (141) ---
+                # --- RESPOSTAS LP1 (141) ---
                 if list_id == "141":
                     sabendo = f.get("[GC 2026 LP1] Origem") or f.get("[2025] Como ficou sabendo do Geração Caldeira?")
                     conn.execute(text("""
@@ -115,9 +125,8 @@ def process():
                         "sab": sabendo
                     })
 
-                # --- MAPEAMENTO LP2 (144) ---
+                # --- RESPOSTAS LP2 (144) ---
                 if list_id == "144":
-                    # Lógica de Gênero conforme seus labels
                     g_raw = str(f.get('[GC 2026 LP2] Gênero') or f.get('[GC 2026] Genero') or f.get('[2025] GÊNERO') or "").lower()
                     if any(x in g_raw for x in ["homem", "masc", "male"]): genero = "Masculino"
                     elif any(x in g_raw for x in ["mulher", "fem", "female"]): genero = "Feminino"
