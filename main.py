@@ -16,8 +16,12 @@ def fetch_pipz(list_id):
     while True:
         url = f"https://campuscaldeira.pipz.io/api/v1/contact/"
         params = {
-            "list_id": list_id, "limit": limit, "offset": offset,
-            "extra_fields": "1", "api_key": PIPZ_KEY, "api_secret": PIPZ_SECRET
+            "list_id": list_id, 
+            "limit": "20",#limit, 
+            "offset": offset,
+            "extra_fields": "1", 
+            "api_key": PIPZ_KEY, 
+            "api_secret": PIPZ_SECRET
         }
         res = requests.get(url, params=params, headers={"Accept": "application/json"})
         if res.status_code == 429:
