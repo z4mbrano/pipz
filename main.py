@@ -27,28 +27,29 @@ def format_timestamp(ts_str):
     except: return None
 
 def normalize_genero(val):
-    """Tratamento de gênero para evitar erro de sobreposição (ex: 'h' em mulher)"""
+    """Tratamento rigoroso de gênero para evitar erro de 'h' em mulher"""
     if not val or str(val).lower() in ["none", "null", ""]:
         return "Não informado"
     txt = str(val).lower().strip()
-    # Verifica Feminino primeiro para evitar conflito com o 'h'
-    if txt.startswith(('m', 'f', 'mu')) or "fem" in txt or "mulher" in txt:
+    # Prioriza feminino para evitar conflito com 'h'
+    if txt.startswith(('f', 'mu')) or "mulher" in txt or "fem" in txt:
         return "Feminino"
     if txt.startswith(('h', 'mas')) or "homem" in txt:
         return "Masculino"
     return "Outros"
 
-def normalize_etnia(f_dict):
-    """Busca e padroniza etnia conforme lógica do Power BI"""
-    campos = ["gc_2026_lp2_etnia", "gc_2026_lp2_qual_etnia", "[GC 2026 LP2] etnia", "[GC 2026 LP2] qual etnia"]
-    vals = [str(f_dict.get(c) or "") for c in campos]
-    texto = " ".join(vals).lower()
-    if "bran" in texto: return "Branca"
-    if "pard" in texto: return "Parda"
-    if "pret" in texto or "negr" in texto: return "Preta"
-    if "indi" in texto: return "Indígena"
-    if "amar" in texto: return "Amarela"
-    return "Outra" if texto.strip() else None
+def normalize_etnia(f):
+    """Busca etnia em múltiplos campos e padroniza"""
+    raw = (f.get("gc_2026_lp2_etnia") or f.get("gc_2026_lp2_qual_etnia") or 
+           f.get("[GC 2026 LP2] etnia") or f.get("[GC 2026 LP2] qual etnia") or 
+           f.get("[2025] ETNIA") or f.get("etnia") or "")
+    txt = str(raw).lower()
+    if "bran" in txt: return "Branca"
+    if "pard" in txt: return "Parda"
+    if "pret" in txt or "negr" in txt: return "Preta"
+    if "indi" in txt: return "Indígena"
+    if "amar" in txt: return "Amarela"
+    return "Outra" if txt.strip() else None
 
 def extract_fields_logic(contact_full):
     if not contact_full: return {}
@@ -76,7 +77,7 @@ def fetch_contact_list(list_id):
     url = "https://campuscaldeira.pipz.io/api/v1/contact/"
     all_contacts = []
     offset = 0
-    while offset < 250: # LIMITE DE 250
+    while offset < 250: # LIMITE SOLICITADO
         params = {"list_id": list_id, "limit": 100, "offset": offset, "api_key": PIPZ_KEY, "api_secret": PIPZ_SECRET}
         res = requests.get(url, params=params)
         if res.status_code == 200:
@@ -91,14 +92,16 @@ def process():
     if not DB_URL: return
     engine = create_engine(DB_URL)
     with engine.connect() as conn:
-        print("--- INICIANDO SYNC (LIMITE 250) ---")
+        print("--- INICIANDO SYNC PROFUNDO (250 CONTATOS) ---")
         for list_id, handler in [("141", "lp1"), ("144", "lp2")]:
             summary_list = fetch_contact_list(list_id)
+            print(f"Processando Lista {list_id}...")
             for summary in summary_list:
                 detail = get_contact_detail(summary['id'])
                 f = extract_fields_logic(detail)
                 if not f: continue
 
+                # PESSOA (Mantido o que funciona)
                 raw_cpf = f.get("gc_2026_lp1_cpf") or f.get("gc_2026_lp2_cpf") or f.get("cpf") or f.get("CPF")
                 nums_cpf = re.sub(r'\D', '', str(raw_cpf)) if raw_cpf else None
                 final_cpf = nums_cpf if nums_cpf and len(nums_cpf) >= 11 else f"ID_{f.get('id')}"
@@ -112,37 +115,47 @@ def process():
                         INSERT INTO form_gc.pessoas (cpf, email, nome, data_nascimento, telefone)
                         VALUES (:cpf, :email, :nome, :birth, :tel)
                         ON CONFLICT (cpf) DO UPDATE SET 
-                            email = EXCLUDED.email, nome = EXCLUDED.nome, 
+                            email = COALESCE(EXCLUDED.email, form_gc.pessoas.email),
+                            nome = COALESCE(EXCLUDED.nome, form_gc.pessoas.nome),
                             data_nascimento = COALESCE(EXCLUDED.data_nascimento, form_gc.pessoas.data_nascimento),
                             telefone = COALESCE(EXCLUDED.telefone, form_gc.pessoas.telefone)
                     """), {"cpf": final_cpf, "email": f.get('email'), "nome": f.get('name'), "birth": birth, "tel": tel})
 
                     if handler == "lp1":
-                        alumni = f.get("gc2026_codigo_alumni") or f.get("gc_2026_codigo_alumni") or f.get("[2025] CUPOM GC 2025")
-                        sabendo = f.get("gc_2026_lp1_origem") or f.get("gc_2026_lp1_como_ficou_sabendo") or f.get("[GC 2026 LP1] Origem")
+                        alumni = f.get("gc2026_codigo_alumni") or f.get("gc_2026_codigo_alumni") or f.get("[GC2026] codigo alumni") or f.get("[2025] CUPOM GC 2025")
+                        sabendo = f.get("gc_2026_lp1_origem") or f.get("[GC 2026 LP1] Origem") or f.get("[2025] Como ficou sabendo do Geração Caldeira?") or f.get("gc_2026_lp1_como_ficou_sabendo")
+                        
                         conn.execute(text("""
                             INSERT INTO form_gc.lp1_respostas (pessoa_id, edicao, estado, cidade, como_ficou_sabendo, codigo_indicacao, data_cadastro, data_resposta)
                             VALUES ((SELECT id FROM form_gc.pessoas WHERE cpf = :cpf), '2026', :est, :cid, :sab, :cod, :dt, NOW())
-                            ON CONFLICT DO NOTHING
+                            ON CONFLICT (pessoa_id, edicao) DO UPDATE SET 
+                                como_ficou_sabendo = COALESCE(EXCLUDED.como_ficou_sabendo, form_gc.lp1_respostas.como_ficou_sabendo),
+                                codigo_indicacao = COALESCE(EXCLUDED.codigo_indicacao, form_gc.lp1_respostas.codigo_indicacao)
                         """), {"cpf": final_cpf, "est": f.get('state'), "cid": f.get('city_name'), "sab": sabendo, "cod": alumni, "dt": dt_cad})
 
                     if handler == "lp2":
-                        genero = normalize_genero(f.get("gc_2026_lp2_genero") or f.get("gc_2026_genero") or f.get("gender") or f.get("[GC 2026 LP2] Gênero"))
+                        genero = normalize_genero(f.get("gc_2026_lp2_genero") or f.get("gc_2026_genero") or f.get("[GC 2026 LP2] Gênero") or f.get("[GC 2026] Genero") or f.get("gender"))
                         etnia = normalize_etnia(f)
-                        trabalha = "Sim" if "sim" in str(f.get("gc_2026_lp2_voce_trabalha") or "").lower() else "Não"
+                        trabalha = "Sim" if "sim" in str(f.get("gc_2026_lp2_voce_trabalha") or f.get("[GC 2026 LP2] você trabalha") or "").lower() else "Não"
+                        
                         conn.execute(text("""
                             INSERT INTO form_gc.lp2_respostas (pessoa_id, edicao, trilha, escola, genero, etnia, trabalha, data_cadastro)
                             VALUES ((SELECT id FROM form_gc.pessoas WHERE cpf = :cpf), '2026', :tri, :esc, :gen, :etn, :tra, :dt)
-                            ON CONFLICT DO NOTHING
+                            ON CONFLICT (pessoa_id, edicao) DO UPDATE SET 
+                                trilha = COALESCE(EXCLUDED.trilha, form_gc.lp2_respostas.trilha),
+                                genero = EXCLUDED.genero,
+                                etnia = COALESCE(EXCLUDED.etnia, form_gc.lp2_respostas.etnia),
+                                trabalha = EXCLUDED.trabalha
                         """), {
-                            "cpf": final_cpf, "tri": f.get("gc_2026_lp2_trilha_educacional"), "esc": f.get("gc_2026_lp2_qual_escola"), 
+                            "cpf": final_cpf, "tri": f.get("gc_2026_lp2_trilha_educacional") or f.get("[GC 2026 LP2] trilha educacional"),
+                            "esc": f.get("gc_2026_lp2_qual_escola") or f.get("[GC 2026 LP2] qual escola") or f.get("Nome da escola"),
                             "gen": genero, "etn": etnia, "tra": trabalha, "dt": dt_cad
                         })
                     trans.commit()
                 except Exception as e:
                     trans.rollback()
-                    print(f"Erro no ID {f.get('id')}: {e}")
-        print("--- PROCESSO FINALIZADO ---")
+                    print(f"Erro ID {f.get('id')}: {e}")
+        print("--- SYNC FINALIZADO ---")
 
 if __name__ == "__main__":
     process()
