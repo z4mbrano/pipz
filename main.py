@@ -26,7 +26,6 @@ def format_timestamp(ts_str):
     except: return None
 
 def normalize_genero(lp2, g2026, root, custom_lp2):
-    """Prioriza os campos customizados vindos da exportação"""
     val = lp2 or g2026 or root or custom_lp2
     if not val: return "Não informado"
     txt = str(val).lower().strip()
@@ -35,7 +34,6 @@ def normalize_genero(lp2, g2026, root, custom_lp2):
     return "Outros"
 
 def normalize_etnia(etnia, qual_etnia, custom_etnia, custom_qual):
-    """Mescla campos originais e campos de exportação"""
     texto = (str(etnia or "") + " " + str(qual_etnia or "") + " " + 
              str(custom_etnia or "") + " " + str(custom_qual or "")).lower()
     if "bran" in texto: return "Branca"
@@ -48,10 +46,8 @@ def normalize_etnia(etnia, qual_etnia, custom_etnia, custom_qual):
 def extract_fields_logic(contact_full):
     if not contact_full: return {}
     data = {}
-    # Captura campos da raiz
     for k, v in contact_full.items():
         if not isinstance(v, (dict, list)): data[k] = v
-    # Captura campos dos Fieldsets
     fs_raw = contact_full.get('fieldsets', [])
     fs_list = fs_raw.values() if isinstance(fs_raw, dict) else fs_raw
     for fs in fs_list:
@@ -90,9 +86,7 @@ def process():
                     if not detail: continue
                     f = extract_fields_logic(detail)
                     
-                    # --- DADOS PESSOA (Novos fallbacks do CSV) ---
-                    raw_cpf = (f.get("gc_2026_lp1_cpf") or f.get("gc_2026_lp2_cpf") or 
-                               f.get("CPF") or f.get("cpf"))
+                    raw_cpf = f.get("gc_2026_lp1_cpf") or f.get("gc_2026_lp2_cpf") or f.get("CPF") or f.get("cpf")
                     nums_cpf = re.sub(r'\D', '', str(raw_cpf)) if raw_cpf else None
                     final_cpf = nums_cpf if nums_cpf and len(nums_cpf) >= 11 else f"ID_{f.get('id')}"
 
@@ -112,49 +106,39 @@ def process():
                         })
                         pessoa_id = p_res.fetchone()[0]
 
-                        # --- LP1 (Fallback Alumni do CSV) ---
+                        # --- LP1 ---
                         if handler == "lp1":
                             sab = f.get("[2025] Como ficou sabendo do Geração Caldeira?") or f.get("gc_2026_lp1_origem")
                             cod = f.get("gc_2026_codigo_alumni") or f.get("[GC2026] codigo alumni") or f.get("contact_custom_gc2026_codigo_alumni") or f.get("gc2026_codigo_alumni")
-                            
                             conn.execute(text("""
                                 INSERT INTO form_gc.lp1_respostas (pessoa_id, edicao, estado, cidade, como_ficou_sabendo, codigo_indicacao, data_cadastro, data_resposta)
                                 VALUES (:p_id, '2026', :est, :cid, :sab, :cod, :dt, NOW())
                                 ON CONFLICT (pessoa_id, edicao) DO UPDATE SET 
                                     como_ficou_sabendo = EXCLUDED.como_ficou_sabendo,
                                     codigo_indicacao = EXCLUDED.codigo_indicacao
-                            """), {
-                                "p_id": pessoa_id, "est": f.get('state'), "cid": f.get('city_name'), 
-                                "sab": sab, "cod": cod, "dt": format_timestamp(f.get('creation_date'))
-                            })
+                            """), {"p_id": pessoa_id, "est": f.get('state'), "cid": f.get('city_name'), "sab": sab, "cod": cod, "dt": format_timestamp(f.get('creation_date'))})
 
-                        # --- LP2 (Fallbacks Custom do CSV) ---
-                        # --- LP2 (Mapeamento Completo com Fallbacks do CSV) ---
+                        # --- LP2 (Mapeamento Completo solicitado) ---
                         if handler == "lp2":
-                            # Gênero (Lógica de prioridade)
-                            gen = normalize_genero(
-                                f.get("gc_2026_lp2_genero"), f.get("gc_2026_genero"), 
-                                f.get('gender'), f.get("contact_custom_gc_2026_lp2_genero")
-                            )
-                            # Etnia (Mescla campos abertos e fechados)
-                            etn = normalize_etnia(
-                                f.get("gc_2026_lp2_etnia"), f.get("gc_2026_lp2_qual_etnia"),
-                                f.get("contact_custom_gc_2026_lp2_etnia"), f.get("contact_custom_gc_2026_lp2_qual_etnia")
-                            )
+                            # Campos complexos (Gênero e Etnia)
+                            gen = normalize_genero(f.get("gc_2026_lp2_genero"), f.get("gc_2026_genero"), f.get('gender'), f.get("contact_custom_gc_2026_lp2_genero"))
+                            etn = normalize_etnia(f.get("gc_2026_lp2_etnia"), f.get("gc_2026_lp2_qual_etnia"), f.get("contact_custom_gc_2026_lp2_etnia"), f.get("contact_custom_gc_2026_lp2_qual_etnia"))
                             
-                            # Mapeamento de campos simples (Direto do f.get)
+                            # Campos simples com fallbacks OR
                             tri = f.get("gc_2026_lp2_trilha_educacional") or f.get("contact_custom_gc_2026_lp2_trilha_educacional")
                             esc = f.get("gc_2026_lp2_qual_escola") or f.get("Nome da escola") or f.get("contact_custom_gc_2026_lp2_qual_escola")
+                            tra_val = f.get("gc_2026_lp2_voce_trabalha") or f.get("contact_custom_gc_2026_lp2_voce_trabalha")
+                            
+                            # Novos campos mapeados da exportação
                             ens_med = f.get("contact_custom_gc_2026_lp2_ensino_medio")
                             tip_esc = f.get("contact_custom_gc_2026_escola_publica_ou_privada")
                             semestre = f.get("contact_custom_gc_2026_lp2_qual_semestre_ano")
                             tur_esc = f.get("contact_custom_gc_2026_lp2_qual_turno")
                             pcd_val = f.get("contact_custom_gc_2026_lp2_acessibilidade")
                             pcd_qual = f.get("contact_custom_gc_2026_lp2_acessibilidade_se_sim")
-                            inst_parc = f.get("contact_custom_gc_2026_lp2_instituio_parceira") # Mantive o erro 'instituio' do seu CSV
-                            tra_val = f.get("gc_2026_lp2_voce_trabalha") or f.get("contact_custom_gc_2026_lp2_voce_trabalha")
+                            inst_parc = f.get("contact_custom_gc_2026_lp2_instituio_parceira")
                             regime = f.get("contact_custom_gc_2026_lp2_regime_trabalho")
-                            carga = f.get("contact_custom_gc_2026_lp2_turno_de_trabalho") # Mapeado conforme estrutura do seu CSV
+                            carga = f.get("contact_custom_gc_2026_lp2_turno_de_trabalho")
 
                             conn.execute(text("""
                                 INSERT INTO form_gc.lp2_respostas (
@@ -168,19 +152,13 @@ def process():
                                     :inst, :tra, :regime, :carga, :dt
                                 )
                                 ON CONFLICT (pessoa_id, edicao) DO UPDATE SET 
-                                    trilha = EXCLUDED.trilha,
-                                    ensino_medio = EXCLUDED.ensino_medio,
-                                    escola = EXCLUDED.escola,
-                                    tipo_escola = EXCLUDED.tipo_escola,
-                                    semestre = EXCLUDED.semestre,
-                                    turno_escola = EXCLUDED.turno_escola,
-                                    genero = EXCLUDED.genero,
-                                    etnia = EXCLUDED.etnia,
-                                    pcd = EXCLUDED.pcd,
-                                    qual_pcd = EXCLUDED.qual_pcd,
+                                    trilha = EXCLUDED.trilha, ensino_medio = EXCLUDED.ensino_medio,
+                                    escola = EXCLUDED.escola, tipo_escola = EXCLUDED.tipo_escola,
+                                    semestre = EXCLUDED.semestre, turno_escola = EXCLUDED.turno_escola,
+                                    genero = EXCLUDED.genero, etnia = EXCLUDED.etnia,
+                                    pcd = EXCLUDED.pcd, qual_pcd = EXCLUDED.qual_pcd,
                                     instituicao_parceira = EXCLUDED.instituicao_parceira,
-                                    trabalha = EXCLUDED.trabalha,
-                                    regime = EXCLUDED.regime,
+                                    trabalha = EXCLUDED.trabalha, regime = EXCLUDED.regime,
                                     carga_horaria = EXCLUDED.carga_horaria
                             """), {
                                 "p_id": pessoa_id, "tri": tri, "ens_med": ens_med, "esc": esc, "tip_esc": tip_esc,
