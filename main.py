@@ -5,6 +5,7 @@ import os
 from sqlalchemy import create_engine, text
 from datetime import datetime
 import re
+import random
 
 # Configurações de ambiente
 PIPZ_KEY = os.getenv("PIPZ_TOKEN")
@@ -14,11 +15,8 @@ DB_URL = os.getenv("DB_URL")
 def format_date_to_db(date_str):
     if not date_str or str(date_str).lower() in ["none", "null", ""]: return None
     clean = str(date_str)[:10].replace("/", "-")
-    try:
-        return datetime.strptime(clean, "%Y-%m-%d").strftime("%Y-%m-%d")
-    except:
-        try: return datetime.strptime(clean, "%d-%m-%Y").strftime("%Y-%m-%d")
-        except: return None
+    try: return datetime.strptime(clean, "%Y-%m-%d").strftime("%Y-%m-%d")
+    except: return None
 
 def format_timestamp(ts_str):
     if not ts_str: return None
@@ -34,8 +32,7 @@ def normalize_genero(lp2, g2026, root, custom_lp2):
     return "Outros"
 
 def normalize_etnia(etnia, qual_etnia, custom_etnia, custom_qual):
-    texto = (str(etnia or "") + " " + str(qual_etnia or "") + " " + 
-             str(custom_etnia or "") + " " + str(custom_qual or "")).lower()
+    texto = (str(etnia or "") + " " + str(qual_etnia or "") + " " + str(custom_etnia or "") + " " + str(custom_qual or "")).lower()
     if "bran" in texto: return "Branca"
     if "pard" in texto: return "Parda"
     if "pret" in texto or "negr" in texto: return "Preta"
@@ -61,6 +58,9 @@ def get_contact_detail(contact_id):
     url = f"https://campuscaldeira.pipz.io/api/v1/contact/{contact_id}/"
     params = {"extra_fields": "1", "api_key": PIPZ_KEY, "api_secret": PIPZ_SECRET}
     res = requests.get(url, params=params, headers={"Accept": "application/json"})
+    if res.status_code == 429:
+        time.sleep(10) # Se bloquear, espera 10s
+        return None
     return res.json() if res.status_code == 200 else None
 
 def process():
@@ -68,51 +68,62 @@ def process():
     engine = create_engine(DB_URL)
     
     with engine.connect() as conn:
-        print(f"--- INICIANDO LOTE: {datetime.now().strftime('%H:%M:%S')} ---")
+        # Pega o total de pessoas já cadastradas para usar como Offset dinâmico
+        count_res = conn.execute(text("SELECT count(*) FROM form_gc.pessoas"))
+        total_no_banco = count_res.fetchone()[0]
         
+        print(f"--- INICIANDO LOTE: {datetime.now().strftime('%H:%M:%S')} ---")
+        print(f"Total atual no banco: {total_no_banco}")
+
         for list_id, handler in [("141", "lp1"), ("144", "lp2")]:
-            print(f"Buscando novos contatos da {handler} (Lista ID: {list_id})...")
-            url = "https://campuscaldeira.pipz.io/api/v1/contact/"
-            params = {"list_id": list_id, "limit": 100, "api_key": PIPZ_KEY, "api_secret": PIPZ_SECRET}
+            # LÓGICA: Processa 100 contatos. 
+            # 50 são os mais recentes (offset 0)
+            # 50 são contatos "antigos" (offset = total_no_banco) para preencher o resto
             
-            res = requests.get(url, params=params)
+            offsets_to_check = [0, total_no_banco]
             
-            # DIAGNÓSTICO: Se não for 200, avisa o motivo
-            if res.status_code != 200:
-                print(f"[ERRO API] Falha ao acessar {handler}. Status: {res.status_code}. Resposta: {res.text[:100]}")
-                continue
+            for current_offset in offsets_to_check:
+                print(f"Buscando novos contatos da {handler} (Offset: {current_offset})...")
+                url = "https://campuscaldeira.pipz.io/api/v1/contact/"
+                params = {"list_id": list_id, "limit": 50, "offset": current_offset, "api_key": PIPZ_KEY, "api_secret": PIPZ_SECRET}
                 
-            batch = res.json().get('objects', [])
-            print(f"Encontrados {len(batch)} contatos. Iniciando sincronização...")
+                res = requests.get(url, params=params)
+                if res.status_code != 200: continue
+                batch = res.json().get('objects', [])
+                
+                for summary in batch:
+                    try:
+                        # Verifica se já temos essa pessoa e se a LP2 já está preenchida
+                        # Se já tivermos, pulamos a chamada de API para economizar
+                        check = conn.execute(text(f"SELECT trilha FROM form_gc.lp2_respostas WHERE pessoa_id = (SELECT id FROM form_gc.pessoas WHERE cpf LIKE 'ID_{summary['id']}' OR email = :email LIMIT 1)"), {"email": summary.get('email')}).fetchone()
+                        if check and check[0]: 
+                            continue # Já temos os dados completos, pula pro próximo
 
-            for summary in batch:
-                try:
-                    detail = get_contact_detail(summary['id'])
-                    if not detail: continue
-                    f = extract_fields_logic(detail)
-                    
-                    # --- DADOS PESSOA ---
-                    raw_cpf = f.get("gc_2026_lp1_cpf") or f.get("gc_2026_lp2_cpf") or f.get("CPF") or f.get("cpf")
-                    nums_cpf = re.sub(r'\D', '', str(raw_cpf)) if raw_cpf else None
-                    final_cpf = nums_cpf if nums_cpf and len(nums_cpf) >= 11 else f"ID_{f.get('id')}"
+                        detail = get_contact_detail(summary['id'])
+                        if not detail: continue
+                        f = extract_fields_logic(detail)
+                        
+                        raw_cpf = f.get("gc_2026_lp1_cpf") or f.get("gc_2026_lp2_cpf") or f.get("CPF") or f.get("cpf")
+                        nums_cpf = re.sub(r'\D', '', str(raw_cpf)) if raw_cpf else None
+                        final_cpf = nums_cpf if nums_cpf and len(nums_cpf) >= 11 else f"ID_{f.get('id')}"
 
-                    with conn.begin():
-                        p_res = conn.execute(text("""
-                            INSERT INTO form_gc.pessoas (cpf, email, nome, data_nascimento, telefone)
-                            VALUES (:cpf, :email, :nome, :birth, :tel)
-                            ON CONFLICT (cpf) DO UPDATE SET 
-                                email = EXCLUDED.email, nome = EXCLUDED.nome,
-                                data_nascimento = COALESCE(EXCLUDED.data_nascimento, form_gc.pessoas.data_nascimento),
-                                telefone = COALESCE(EXCLUDED.telefone, form_gc.pessoas.telefone)
-                            RETURNING id
-                        """), {
-                            "cpf": final_cpf, "email": f.get('email'), "nome": f.get('name'),
-                            "birth": format_date_to_db(f.get('birthdate') or f.get('birthday')),
-                            "tel": f.get('mobile_phone') or f.get('phone')
-                        })
-                        pessoa_id = p_res.fetchone()[0]
+                        with conn.begin():
+                            p_res = conn.execute(text("""
+                                INSERT INTO form_gc.pessoas (cpf, email, nome, data_nascimento, telefone)
+                                VALUES (:cpf, :email, :nome, :birth, :tel)
+                                ON CONFLICT (cpf) DO UPDATE SET 
+                                    email = EXCLUDED.email, nome = EXCLUDED.nome,
+                                    data_nascimento = COALESCE(EXCLUDED.data_nascimento, form_gc.pessoas.data_nascimento),
+                                    telefone = COALESCE(EXCLUDED.telefone, form_gc.pessoas.telefone)
+                                RETURNING id
+                            """), {
+                                "cpf": final_cpf, "email": f.get('email'), "nome": f.get('name'),
+                                "birth": format_date_to_db(f.get('birthdate') or f.get('birthday')),
+                                "tel": f.get('mobile_phone') or f.get('phone')
+                            })
+                            pessoa_id = p_res.fetchone()[0]
 
-                        # --- LP1 ---
+                            # --- LP1 ---
                         if handler == "lp1":
                             sab = f.get("[2025] Como ficou sabendo do Geração Caldeira?") or f.get("gc_2026_lp1_origem") or f.get("contact_custom_gc_2026_lp1_origem")
                             # Corrigido Alumni baseado no seu CSV (sem underline no gc2026)
@@ -174,10 +185,10 @@ def process():
                                 "carga": f.get("contact_custom_gc_2026_lp2_turno_de_trabalho"),
                                 "dt": format_timestamp(f.get('creation_date'))
                             })
-                except Exception as e:
-                    print(f"[ERRO] Usuário {summary.get('id')} não processado: {str(e)[:150]}")
+                    except Exception as e:
+                        print(f"[ERRO] Usuário {summary.get('id')} falhou: {str(e)[:100]}")
 
-        print("--- LOTE FINALIZADO COM SUCESSO ---")
+        print("--- LOTE FINALIZADO ---")
 
 if __name__ == "__main__":
     process()
