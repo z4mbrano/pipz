@@ -5,7 +5,6 @@ import os
 from sqlalchemy import create_engine, text
 from datetime import datetime
 import re
-import random
 
 # Configurações de ambiente
 PIPZ_KEY = os.getenv("PIPZ_TOKEN")
@@ -59,7 +58,7 @@ def get_contact_detail(contact_id):
     params = {"extra_fields": "1", "api_key": PIPZ_KEY, "api_secret": PIPZ_SECRET}
     res = requests.get(url, params=params, headers={"Accept": "application/json"})
     if res.status_code == 429:
-        time.sleep(10) # Se bloquear, espera 10s
+        time.sleep(10)
         return None
     return res.json() if res.status_code == 200 else None
 
@@ -68,22 +67,17 @@ def process():
     engine = create_engine(DB_URL)
     
     with engine.connect() as conn:
-        # Pega o total de pessoas já cadastradas para usar como Offset dinâmico
-        count_res = conn.execute(text("SELECT count(*) FROM form_gc.pessoas"))
-        total_no_banco = count_res.fetchone()[0]
+        # Pega o total atual e encerra a transação imediatamente para evitar o erro de 'already initialized'
+        total_no_banco = conn.execute(text("SELECT count(*) FROM form_gc.pessoas")).scalar()
+        conn.commit() 
         
         print(f"--- INICIANDO LOTE: {datetime.now().strftime('%H:%M:%S')} ---")
         print(f"Total atual no banco: {total_no_banco}")
 
         for list_id, handler in [("141", "lp1"), ("144", "lp2")]:
-            # LÓGICA: Processa 100 contatos. 
-            # 50 são os mais recentes (offset 0)
-            # 50 são contatos "antigos" (offset = total_no_banco) para preencher o resto
-            
-            offsets_to_check = [0, total_no_banco]
-            
-            for current_offset in offsets_to_check:
-                print(f"Buscando novos contatos da {handler} (Offset: {current_offset})...")
+            # Processa 50 novos e 50 antigos por rodada (Total 100 por lista)
+            for current_offset in [0, total_no_banco]:
+                print(f"Buscando {handler} (Offset: {current_offset})...")
                 url = "https://campuscaldeira.pipz.io/api/v1/contact/"
                 params = {"list_id": list_id, "limit": 50, "offset": current_offset, "api_key": PIPZ_KEY, "api_secret": PIPZ_SECRET}
                 
@@ -93,11 +87,11 @@ def process():
                 
                 for summary in batch:
                     try:
-                        # Verifica se já temos essa pessoa e se a LP2 já está preenchida
-                        # Se já tivermos, pulamos a chamada de API para economizar
-                        check = conn.execute(text(f"SELECT trilha FROM form_gc.lp2_respostas WHERE pessoa_id = (SELECT id FROM form_gc.pessoas WHERE cpf LIKE 'ID_{summary['id']}' OR email = :email LIMIT 1)"), {"email": summary.get('email')}).fetchone()
-                        if check and check[0]: 
-                            continue # Já temos os dados completos, pula pro próximo
+                        # Verifica se já temos a trilha para economizar API
+                        check = conn.execute(text("SELECT 1 FROM form_gc.lp2_respostas WHERE pessoa_id = (SELECT id FROM form_gc.pessoas WHERE cpf = :cpf OR email = :email LIMIT 1) AND trilha IS NOT NULL"), 
+                                            {"cpf": f"ID_{summary['id']}", "email": summary.get('email')}).fetchone()
+                        conn.commit()
+                        if check: continue 
 
                         detail = get_contact_detail(summary['id'])
                         if not detail: continue
@@ -107,6 +101,7 @@ def process():
                         nums_cpf = re.sub(r'\D', '', str(raw_cpf)) if raw_cpf else None
                         final_cpf = nums_cpf if nums_cpf and len(nums_cpf) >= 11 else f"ID_{f.get('id')}"
 
+                        # Bloco de escrita com transação isolada
                         with conn.begin():
                             p_res = conn.execute(text("""
                                 INSERT INTO form_gc.pessoas (cpf, email, nome, data_nascimento, telefone)
@@ -123,68 +118,31 @@ def process():
                             })
                             pessoa_id = p_res.fetchone()[0]
 
-                            # --- LP1 ---
-                        if handler == "lp1":
-                            sab = f.get("[2025] Como ficou sabendo do Geração Caldeira?") or f.get("gc_2026_lp1_origem") or f.get("contact_custom_gc_2026_lp1_origem")
-                            # Corrigido Alumni baseado no seu CSV (sem underline no gc2026)
-                            cod = f.get("gc2026_codigo_alumni") or f.get("gc_2026_codigo_alumni") or f.get("contact_custom_gc2026_codigo_alumni")
-                            
-                            conn.execute(text("""
-                                INSERT INTO form_gc.lp1_respostas (pessoa_id, edicao, estado, cidade, como_ficou_sabendo, codigo_indicacao, data_cadastro, data_resposta)
-                                VALUES (:p_id, '2026', :est, :cid, :sab, :cod, :dt, NOW())
-                                ON CONFLICT (pessoa_id, edicao) DO UPDATE SET 
-                                    como_ficou_sabendo = EXCLUDED.como_ficou_sabendo,
-                                    codigo_indicacao = EXCLUDED.codigo_indicacao
-                            """), {
-                                "p_id": pessoa_id, "est": f.get('state'), "cid": f.get('city_name'), 
-                                "sab": sab, "cod": cod, "dt": format_timestamp(f.get('creation_date'))
-                            })
+                            if handler == "lp1":
+                                sab = f.get("[2025] Como ficou sabendo do Geração Caldeira?") or f.get("gc_2026_lp1_origem") or f.get("contact_custom_gc_2026_lp1_origem")
+                                cod = f.get("gc2026_codigo_alumni") or f.get("gc_2026_codigo_alumni") or f.get("contact_custom_gc2026_codigo_alumni")
+                                conn.execute(text("""
+                                    INSERT INTO form_gc.lp1_respostas (pessoa_id, edicao, estado, cidade, como_ficou_sabendo, codigo_indicacao, data_cadastro, data_resposta)
+                                    VALUES (:p_id, '2026', :est, :cid, :sab, :cod, :dt, NOW())
+                                    ON CONFLICT (pessoa_id, edicao) DO UPDATE SET como_ficou_sabendo = EXCLUDED.como_ficou_sabendo, codigo_indicacao = EXCLUDED.codigo_indicacao
+                                """), {"p_id": pessoa_id, "est": f.get('state'), "cid": f.get('city_name'), "sab": sab, "cod": cod, "dt": format_timestamp(f.get('creation_date'))})
 
-                        # --- LP2 (Mapeamento Completo com 17 campos) ---
-                        if handler == "lp2":
-                            gen = normalize_genero(f.get("gc_2026_lp2_genero"), f.get("gc_2026_genero"), f.get('gender'), f.get("contact_custom_gc_2026_lp2_genero"))
-                            etn = normalize_etnia(f.get("gc_2026_lp2_etnia"), f.get("gc_2026_lp2_qual_etnia"), f.get("contact_custom_gc_2026_lp2_etnia"), f.get("contact_custom_gc_2026_lp2_qual_etnia"))
-                            
-                            tra_val = f.get("gc_2026_lp2_voce_trabalha") or f.get("contact_custom_gc_2026_lp2_voce_trabalha")
-                            
-                            # Mapeamento técnico baseado no seu CSV
-                            conn.execute(text("""
-                                INSERT INTO form_gc.lp2_respostas (
-                                    pessoa_id, edicao, trilha, ensino_medio, escola, tipo_escola, 
-                                    semestre, turno_escola, genero, etnia, pcd, qual_pcd, 
-                                    instituicao_parceira, trabalha, regime, carga_horaria, data_cadastro
-                                )
-                                VALUES (
-                                    :p_id, '2026', :tri, :ens_med, :esc, :tip_esc, 
-                                    :semestre, :tur_esc, :gen, :etn, :pcd, :pcd_qual, 
-                                    :inst, :tra, :regime, :carga, :dt
-                                )
-                                ON CONFLICT (pessoa_id, edicao) DO UPDATE SET 
-                                    trilha = EXCLUDED.trilha, ensino_medio = EXCLUDED.ensino_medio,
-                                    escola = EXCLUDED.escola, tipo_escola = EXCLUDED.tipo_escola,
-                                    semestre = EXCLUDED.semestre, turno_escola = EXCLUDED.turno_escola,
-                                    genero = EXCLUDED.genero, etnia = EXCLUDED.etnia,
-                                    pcd = EXCLUDED.pcd, qual_pcd = EXCLUDED.qual_pcd,
-                                    instituicao_parceira = EXCLUDED.instituicao_parceira,
-                                    trabalha = EXCLUDED.trabalha, regime = EXCLUDED.regime,
-                                    carga_horaria = EXCLUDED.carga_horaria
-                            """), {
-                                "p_id": pessoa_id,
-                                "tri": f.get("gc_2026_lp2_trilha_educacional") or f.get("contact_custom_gc_2026_lp2_trilha_educacional"),
-                                "ens_med": f.get("contact_custom_gc_2026_lp2_ensino_medio"),
-                                "esc": f.get("gc_2026_lp2_qual_escola") or f.get("contact_custom_gc_2026_lp2_qual_escola") or f.get("Nome da escola"),
-                                "tip_esc": f.get("contact_custom_gc_2026_escola_publica_ou_privada"),
-                                "semestre": f.get("contact_custom_gc_2026_lp2_qual_semestre_ano"),
-                                "tur_esc": f.get("contact_custom_gc_2026_lp2_qual_turno"),
-                                "gen": gen, "etn": etn,
-                                "pcd": f.get("contact_custom_gc_2026_lp2_acessibilidade"),
-                                "pcd_qual": f.get("contact_custom_gc_2026_lp2_acessibilidade_se_sim"),
-                                "inst": f.get("contact_custom_gc_2026_lp2_instituio_parceira"), # Mantido erro do CSV
-                                "tra": "Sim" if "sim" in str(tra_val or "").lower() else "Não",
-                                "regime": f.get("contact_custom_gc_2026_lp2_regime_trabalho"),
-                                "carga": f.get("contact_custom_gc_2026_lp2_turno_de_trabalho"),
-                                "dt": format_timestamp(f.get('creation_date'))
-                            })
+                            if handler == "lp2":
+                                gen = normalize_genero(f.get("gc_2026_lp2_genero"), f.get("gc_2026_genero"), f.get('gender'), f.get("contact_custom_gc_2026_lp2_genero"))
+                                etn = normalize_etnia(f.get("gc_2026_lp2_etnia"), f.get("gc_2026_lp2_qual_etnia"), f.get("contact_custom_gc_2026_lp2_etnia"), f.get("contact_custom_gc_2026_lp2_qual_etnia"))
+                                tra_val = f.get("gc_2026_lp2_voce_trabalha") or f.get("contact_custom_gc_2026_lp2_voce_trabalha")
+                                
+                                conn.execute(text("""
+                                    INSERT INTO form_gc.lp2_respostas (pessoa_id, edicao, trilha, ensino_medio, escola, tipo_escola, semestre, turno_escola, genero, etnia, pcd, qual_pcd, instituicao_parceira, trabalha, regime, carga_horaria, data_cadastro)
+                                    VALUES (:p_id, '2026', :tri, :ens_med, :esc, :tip_esc, :semestre, :tur_esc, :gen, :etn, :pcd, :pcd_qual, :inst, :tra, :regime, :carga, :dt)
+                                    ON CONFLICT (pessoa_id, edicao) DO UPDATE SET trilha = EXCLUDED.trilha, genero = EXCLUDED.genero, etnia = EXCLUDED.etnia, trabalha = EXCLUDED.trabalha
+                                """), {
+                                    "p_id": pessoa_id, "tri": f.get("gc_2026_lp2_trilha_educacional") or f.get("contact_custom_gc_2026_lp2_trilha_educacional"),
+                                    "ens_med": f.get("contact_custom_gc_2026_lp2_ensino_medio"), "esc": f.get("gc_2026_lp2_qual_escola") or f.get("contact_custom_gc_2026_lp2_qual_escola") or f.get("Nome da escola"),
+                                    "tip_esc": f.get("contact_custom_gc_2026_escola_publica_ou_privada"), "semestre": f.get("contact_custom_gc_2026_lp2_qual_semestre_ano"), "tur_esc": f.get("contact_custom_gc_2026_lp2_qual_turno"),
+                                    "gen": gen, "etn": etn, "pcd": f.get("contact_custom_gc_2026_lp2_acessibilidade"), "pcd_qual": f.get("contact_custom_gc_2026_lp2_acessibilidade_se_sim"), "inst": f.get("contact_custom_gc_2026_lp2_instituio_parceira"),
+                                    "tra": "Sim" if "sim" in str(tra_val or "").lower() else "Não", "regime": f.get("contact_custom_gc_2026_lp2_regime_trabalho"), "carga": f.get("contact_custom_gc_2026_lp2_turno_de_trabalho"), "dt": format_timestamp(f.get('creation_date'))
+                                })
                     except Exception as e:
                         print(f"[ERRO] Usuário {summary.get('id')} falhou: {str(e)[:100]}")
 
