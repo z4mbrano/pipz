@@ -56,12 +56,11 @@ def extract_fields_logic(contact_full):
     return data
 
 def get_contact_detail(contact_id):
-    """Fallback: Só chama se faltar dado na lista."""
     url = f"https://campuscaldeira.pipz.io/api/v1/contact/{contact_id}/"
     params = {"extra_fields": "1", "api_key": PIPZ_KEY, "api_secret": PIPZ_SECRET}
     res = requests.get(url, params=params, headers={"Accept": "application/json"})
     if res.status_code == 429:
-        time.sleep(5)
+        time.sleep(5) # Respira um pouco se o Pipz chiar
         return None
     return res.json() if res.status_code == 200 else None
 
@@ -70,16 +69,15 @@ def process():
     engine = create_engine(DB_URL)
     
     with engine.connect() as conn:
-        print(f"--- INICIANDO VARREDURA TOTAL: {datetime.now().strftime('%H:%M:%S')} ---")
+        print(f"--- INICIANDO CARGA RÁPIDA (Retomar): {datetime.now().strftime('%H:%M:%S')} ---")
 
         for list_id, handler in [("141", "lp1"), ("144", "lp2")]:
+            print(f"\n[{handler.upper()}] Buscando contatos...")
             offset = 0
             limit = 100
             
             while True:
-                print(f"[{handler}] Lendo página (Offset {offset})...")
                 url = "https://campuscaldeira.pipz.io/api/v1/contact/"
-                # O SEGREDO ESTÁ AQUI: include_fieldsets=1 faz o Pipz mandar TUDO na lista
                 params = {
                     "list_id": list_id, "limit": limit, "offset": offset, 
                     "api_key": PIPZ_KEY, "api_secret": PIPZ_SECRET,
@@ -90,18 +88,33 @@ def process():
                 if res.status_code != 200: break
                 
                 batch = res.json().get('objects', [])
-                if not batch: 
-                    print(f"[{handler}] Fim da lista alcançado!")
-                    break
+                if not batch: break
+                
+                novos_processados = 0
                 
                 for summary in batch:
                     try:
-                        # Extrai os dados DIRETO da lista (sem chamar a API de detalhe)
-                        f = extract_fields_logic(summary)
+                        email = summary.get('email')
                         
+                        # --- O PULO DO GATO (Ignora quem já tá no banco) ---
+                        if email:
+                            tabela = "lp1_respostas" if handler == "lp1" else "lp2_respostas"
+                            check = conn.execute(text(f"""
+                                SELECT 1 FROM form_gc.{tabela} r
+                                JOIN form_gc.pessoas p ON p.id = r.pessoa_id
+                                WHERE p.email = :email LIMIT 1
+                            """), {"email": email}).fetchone()
+                            conn.commit() # Libera transação
+                            
+                            if check:
+                                continue # PULA INSTANTANEAMENTE!
+
+                        # Se chegou aqui, é porque a pessoa é NOVA (ou falta essa tabela)
+                        novos_processados += 1
+                        
+                        f = extract_fields_logic(summary)
                         raw_cpf = f.get("gc_2026_lp1_cpf") or f.get("gc_2026_lp2_cpf") or f.get("CPF") or f.get("cpf")
                         
-                        # Se por acaso o Pipz não mandou o CPF na lista, aí sim pedimos o detalhe
                         if not raw_cpf:
                             detail = get_contact_detail(summary['id'])
                             if detail:
@@ -111,7 +124,6 @@ def process():
                         nums_cpf = re.sub(r'\D', '', str(raw_cpf)) if raw_cpf else None
                         final_cpf = nums_cpf if nums_cpf and len(nums_cpf) >= 11 else f"ID_{f.get('id')}"
 
-                        # Abre a transação para gravar no banco
                         with conn.begin():
                             p_res = conn.execute(text("""
                                 INSERT INTO form_gc.pessoas (cpf, email, nome, data_nascimento, telefone)
@@ -156,17 +168,10 @@ def process():
                     except Exception as e:
                         print(f"[ERRO] Usuário {summary.get('id')} falhou: {str(e)[:100]}")
                 
+                print(f"Página (Offset {offset}): {novos_processados} API Chamadas, {100 - novos_processados} existiam e foram pulados.")
                 offset += limit
-                time.sleep(0.5) # Pausa curtinha só pra API não chiar
                 
-                # --- TRAVA PARA USO DIÁRIO ---
-                # DEPOIS que você rodar esse script uma vez e ele carregar as 40.000 pessoas,
-                # tire o "#" da linha abaixo para que o robô do Github não fique 
-                # lendo a base inteira a cada 20 minutos (lendo só as 10 primeiras páginas).
-                #
-                # if offset >= 1000: break
-
-        print("--- VARREDURA FINALIZADA COM SUCESSO ---")
+        print("--- CARGA RÁPIDA FINALIZADA ---")
 
 if __name__ == "__main__":
     process()
