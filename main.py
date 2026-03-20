@@ -60,23 +60,21 @@ def process():
     engine = create_engine(DB_URL)
     
     with engine.connect() as conn:
-        print(f"--- INICIANDO VARREDURA TOTAL TURBO: {datetime.now().strftime('%H:%M:%S')} ---")
+        print(f"--- INICIANDO VARREDURA DE DADOS: {datetime.now().strftime('%H:%M:%S')} ---")
 
         for list_id, handler in [("141", "lp1"), ("144", "lp2")]:
-            print(f"\n--- Sincronizando {handler.upper()} (Lista {list_id}) ---")
+            print(f"\n--- Processando Inscrições {handler.upper()} (Lista {list_id}) ---")
             offset = 0
             limit = 100
             
             while True:
                 url = "https://campuscaldeira.pipz.io/api/v1/contact/"
-                # include_fieldsets=1 é o segredo que traz tudo na lista
                 params = {
                     "list_id": list_id, "limit": limit, "offset": offset, 
                     "api_key": PIPZ_KEY, "api_secret": PIPZ_SECRET,
                     "include_fieldsets": "1", "extra_fields": "1"
                 }
                 
-                # TENTA 3 VEZES SE O PIPZ FALHAR
                 success = False
                 for attempt in range(3):
                     res = requests.get(url, params=params)
@@ -84,28 +82,53 @@ def process():
                         success = True
                         break
                     else:
-                        time.sleep(5) # Respira 5s se a API chiar
+                        time.sleep(5)
                         
                 if not success:
-                    print(f"[{handler}] Parando na página {offset}. Erro do Pipz: {res.status_code} - {res.text[:100]}")
+                    print(f"[{handler}] Erro de comunicação com o Pipz. Parando no offset {offset}.")
                     break
                 
                 batch = res.json().get('objects', [])
                 if not batch: 
-                    print(f"[{handler}] Fim da lista! Todos os registros processados.")
+                    print(f"[{handler}] Fim da lista alcançado.")
                     break
                 
+                inscricoes_validas = 0
+                cadastros_incompletos = 0
+
                 for summary in batch:
-                    # Sem chamadas secundárias! Pega os dados que já vieram da lista.
                     f = extract_fields_logic(summary)
                     
+                    # 1. VALIDAÇÃO DE IDENTIDADE (Pessoa Real com CPF)
                     raw_cpf = f.get("gc_2026_lp1_cpf") or f.get("gc_2026_lp2_cpf") or f.get("CPF") or f.get("cpf")
                     nums_cpf = re.sub(r'\D', '', str(raw_cpf)) if raw_cpf else None
-                    final_cpf = nums_cpf if nums_cpf and len(nums_cpf) >= 11 else f"ID_{summary.get('id')}"
+                    
+                    # Se não tem 11 números, a pessoa não tem uma inscrição formal válida
+                    if not nums_cpf or len(nums_cpf) < 11:
+                        cadastros_incompletos += 1
+                        continue 
+                        
+                    final_cpf = nums_cpf[:11]
+
+                    # 2. VALIDAÇÃO DE ETAPA (Verifica se realmente preencheu o formulário)
+                    if handler == "lp2":
+                        tri = f.get("gc_2026_lp2_trilha_educacional") or f.get("contact_custom_gc_2026_lp2_trilha_educacional")
+                        if not tri or str(tri).strip() == "":
+                            cadastros_incompletos += 1
+                            continue # Consta na lista, mas não completou o forms da LP2
+                            
+                    if handler == "lp1":
+                        est = f.get('state')
+                        cid = f.get('city_name')
+                        if not est and not cid:
+                            cadastros_incompletos += 1
+                            continue # Caiu na LP1 sem os dados base
+                            
+                    inscricoes_validas += 1
 
                     try:
                         with conn.begin():
-                            # UPSERT PESSOA
+                            # UPSERT PESSOA (Garantido que tem CPF)
                             p_res = conn.execute(text("""
                                 INSERT INTO form_gc.pessoas (cpf, email, nome, data_nascimento, telefone)
                                 VALUES (:cpf, :email, :nome, :birth, :tel)
@@ -129,7 +152,7 @@ def process():
                                     INSERT INTO form_gc.lp1_respostas (pessoa_id, edicao, estado, cidade, como_ficou_sabendo, codigo_indicacao, data_cadastro, data_resposta)
                                     VALUES (:p_id, '2026', :est, :cid, :sab, :cod, :dt, NOW())
                                     ON CONFLICT (pessoa_id, edicao) DO UPDATE SET como_ficou_sabendo = EXCLUDED.como_ficou_sabendo, codigo_indicacao = EXCLUDED.codigo_indicacao
-                                """), {"p_id": pessoa_id, "est": f.get('state'), "cid": f.get('city_name'), "sab": sab, "cod": cod, "dt": format_timestamp(f.get('creation_date'))})
+                                """), {"p_id": pessoa_id, "est": est, "cid": cid, "sab": sab, "cod": cod, "dt": format_timestamp(f.get('creation_date'))})
 
                             # UPSERT LP2
                             if handler == "lp2":
@@ -158,23 +181,20 @@ def process():
                                         trabalha = EXCLUDED.trabalha, regime = EXCLUDED.regime,
                                         carga_horaria = EXCLUDED.carga_horaria
                                 """), {
-                                    "p_id": pessoa_id, "tri": f.get("gc_2026_lp2_trilha_educacional") or f.get("contact_custom_gc_2026_lp2_trilha_educacional"),
+                                    "p_id": pessoa_id, "tri": tri,
                                     "ens_med": f.get("contact_custom_gc_2026_lp2_ensino_medio"), "esc": f.get("gc_2026_lp2_qual_escola") or f.get("contact_custom_gc_2026_lp2_qual_escola") or f.get("Nome da escola"),
                                     "tip_esc": f.get("contact_custom_gc_2026_escola_publica_ou_privada"), "semestre": f.get("contact_custom_gc_2026_lp2_qual_semestre_ano"), "tur_esc": f.get("contact_custom_gc_2026_lp2_qual_turno"),
                                     "gen": gen, "etn": etn, "pcd": f.get("contact_custom_gc_2026_lp2_acessibilidade"), "pcd_qual": f.get("contact_custom_gc_2026_lp2_acessibilidade_se_sim"), "inst": f.get("contact_custom_gc_2026_lp2_instituio_parceira"),
                                     "tra": "Sim" if "sim" in str(tra_val or "").lower() else "Não", "regime": f.get("contact_custom_gc_2026_lp2_regime_trabalho"), "carga": f.get("contact_custom_gc_2026_lp2_turno_de_trabalho"), "dt": format_timestamp(f.get('creation_date'))
                                 })
                     except Exception as e:
-                        print(f"[ERRO BANCO] Falha ao gravar ID {summary.get('id')}: {str(e)[:100]}")
+                        print(f"[ERRO BANCO] ID {summary.get('id')}: {str(e)[:100]}")
                 
-                print(f"[{handler}] Página (Offset {offset}): {len(batch)} usuários processados/atualizados.")
+                print(f"[{handler}] Página {offset}: {inscricoes_validas} Inscrições válidas. {cadastros_incompletos} Cadastros incompletos (ignorados).")
                 offset += limit
+                time.sleep(0.5)
                 
-                # --- USO DIÁRIO DE ROTINA (20 min) ---
-                # Apenas remova o "#" da linha abaixo DEPOIS que essa carga massiva inteira for concluída.
-                # if offset >= 500: break
-                
-        print("\n--- VARREDURA FINALIZADA COM SUCESSO ---")
+        print("\n--- VARREDURA FINALIZADA ---")
 
 if __name__ == "__main__":
     process()
