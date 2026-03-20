@@ -42,10 +42,20 @@ def normalize_etnia(etnia, qual_etnia, custom_etnia, custom_qual):
     return "Outra" if texto.strip() else None
 
 def extract_fields_logic(contact_full):
+    """Extrai campos da raiz, do fieldsets e do custom_fields (Para driblar o bloqueio do Pipz)"""
     if not contact_full: return {}
     data = {}
+    
+    # 1. Raiz
     for k, v in contact_full.items():
         if not isinstance(v, (dict, list)): data[k] = v
+        
+    # 2. Custom Fields (Algumas vezes o Pipz joga os dados aqui)
+    cf = contact_full.get('custom_fields', {})
+    if isinstance(cf, dict):
+        for k, v in cf.items(): data[k] = v
+            
+    # 3. Fieldsets
     fs_raw = contact_full.get('fieldsets', [])
     fs_list = fs_raw.values() if isinstance(fs_raw, dict) else fs_raw
     for fs in fs_list:
@@ -55,15 +65,23 @@ def extract_fields_logic(contact_full):
             if label: data[label] = val
     return data
 
+def get_contact_detail(contact_id):
+    url = f"https://campuscaldeira.pipz.io/api/v1/contact/{contact_id}/"
+    params = {"extra_fields": "1", "api_key": PIPZ_KEY, "api_secret": PIPZ_SECRET}
+    res = requests.get(url, params=params, headers={"Accept": "application/json"})
+    if res.status_code == 429:
+        time.sleep(5)
+    return res.json() if res.status_code == 200 else None
+
 def process():
     if not DB_URL: return
     engine = create_engine(DB_URL)
     
     with engine.connect() as conn:
-        print(f"--- INICIANDO VARREDURA DE DADOS: {datetime.now().strftime('%H:%M:%S')} ---")
+        print(f"--- INICIANDO VARREDURA DE INTEGRIDADE: {datetime.now().strftime('%H:%M:%S')} ---")
 
         for list_id, handler in [("141", "lp1"), ("144", "lp2")]:
-            print(f"\n--- Processando Inscrições {handler.upper()} (Lista {list_id}) ---")
+            print(f"\n--- Processando {handler.upper()} (Lista {list_id}) ---")
             offset = 0
             limit = 100
             
@@ -85,50 +103,74 @@ def process():
                         time.sleep(5)
                         
                 if not success:
-                    print(f"[{handler}] Erro de comunicação com o Pipz. Parando no offset {offset}.")
+                    print(f"[{handler}] Erro do Pipz. Parando no offset {offset}.")
                     break
                 
                 batch = res.json().get('objects', [])
                 if not batch: 
-                    print(f"[{handler}] Fim da lista alcançado.")
+                    print(f"[{handler}] Fim da lista!")
                     break
                 
-                inscricoes_validas = 0
-                cadastros_incompletos = 0
+                processados = 0
+                ignorados = 0
 
                 for summary in batch:
                     f = extract_fields_logic(summary)
+                    email = f.get('email')
                     
-                    # 1. VALIDAÇÃO DE IDENTIDADE (Pessoa Real com CPF)
-                    raw_cpf = f.get("gc_2026_lp1_cpf") or f.get("gc_2026_lp2_cpf") or f.get("CPF") or f.get("cpf")
-                    nums_cpf = re.sub(r'\D', '', str(raw_cpf)) if raw_cpf else None
-                    
-                    # Se não tem 11 números, a pessoa não tem uma inscrição formal válida
-                    if not nums_cpf or len(nums_cpf) < 11:
-                        cadastros_incompletos += 1
-                        continue 
-                        
-                    final_cpf = nums_cpf[:11]
+                    # Verifica se o usuário JÁ EXISTE no seu banco para não pedir dados pro Pipz à toa
+                    db_pessoa = None
+                    if email:
+                        db_pessoa = conn.execute(text("SELECT id, cpf FROM form_gc.pessoas WHERE email = :email LIMIT 1"), {"email": email}).fetchone()
+                        conn.commit()
 
-                    # 2. VALIDAÇÃO DE ETAPA (Verifica se realmente preencheu o formulário)
+                    precisa_detail = False
+                    
+                    # 1. Valida CPF (Só pede detail se não tiver no banco E não vier na lista)
+                    raw_cpf = f.get("gc_2026_lp1_cpf") or f.get("gc_2026_lp2_cpf") or f.get("CPF") or f.get("cpf") or f.get("contact_custom_gc_2026_lp1_cpf")
+                    nums_cpf = re.sub(r'\D', '', str(raw_cpf)) if raw_cpf else None
+                    if not db_pessoa and (not nums_cpf or len(nums_cpf) < 11):
+                        precisa_detail = True
+                        
+                    # 2. Valida Trilha (LP2)
+                    tri = f.get("gc_2026_lp2_trilha_educacional") or f.get("contact_custom_gc_2026_lp2_trilha_educacional")
+                    if handler == "lp2" and (not tri or str(tri).strip() == ""):
+                        precisa_detail = True
+                        
+                    # Busca o detalhe APENAS se o dado obrigatório não estiver no resumo e nem no banco
+                    if precisa_detail:
+                        detail = get_contact_detail(summary['id'])
+                        if detail:
+                            f.update(extract_fields_logic(detail)) # Mescla as informações
+                            
+                    # --- DECISÃO FINAL: LIXO OU VÁLIDO? ---
+                    # CPF Final
+                    if not db_pessoa and email: # Tenta achar no banco de novo caso o email tenha vindo só no detalhe
+                        db_pessoa = conn.execute(text("SELECT id, cpf FROM form_gc.pessoas WHERE email = :email LIMIT 1"), {"email": email}).fetchone()
+                        conn.commit()
+
+                    if db_pessoa:
+                        final_cpf = db_pessoa[1] # Pega o CPF direto do seu banco (100% confiável)
+                    else:
+                        raw_cpf = f.get("gc_2026_lp1_cpf") or f.get("gc_2026_lp2_cpf") or f.get("CPF") or f.get("cpf") or f.get("contact_custom_gc_2026_lp1_cpf")
+                        nums_cpf = re.sub(r'\D', '', str(raw_cpf)) if raw_cpf else None
+                        if not nums_cpf or len(nums_cpf) < 11:
+                            ignorados += 1
+                            continue # LIXO 1: Pessoa sem CPF = Inscrição falsa
+                        final_cpf = nums_cpf[:11]
+                        
+                    # Trilha Final (Se for LP2)
                     if handler == "lp2":
                         tri = f.get("gc_2026_lp2_trilha_educacional") or f.get("contact_custom_gc_2026_lp2_trilha_educacional")
                         if not tri or str(tri).strip() == "":
-                            cadastros_incompletos += 1
-                            continue # Consta na lista, mas não completou o forms da LP2
+                            ignorados += 1
+                            continue # LIXO 2: Entrou na lista LP2 mas não respondeu a Trilha
                             
-                    if handler == "lp1":
-                        est = f.get('state')
-                        cid = f.get('city_name')
-                        if not est and not cid:
-                            cadastros_incompletos += 1
-                            continue # Caiu na LP1 sem os dados base
-                            
-                    inscricoes_validas += 1
+                    processados += 1
 
                     try:
                         with conn.begin():
-                            # UPSERT PESSOA (Garantido que tem CPF)
+                            # UPSERT PESSOA
                             p_res = conn.execute(text("""
                                 INSERT INTO form_gc.pessoas (cpf, email, nome, data_nascimento, telefone)
                                 VALUES (:cpf, :email, :nome, :birth, :tel)
@@ -152,7 +194,7 @@ def process():
                                     INSERT INTO form_gc.lp1_respostas (pessoa_id, edicao, estado, cidade, como_ficou_sabendo, codigo_indicacao, data_cadastro, data_resposta)
                                     VALUES (:p_id, '2026', :est, :cid, :sab, :cod, :dt, NOW())
                                     ON CONFLICT (pessoa_id, edicao) DO UPDATE SET como_ficou_sabendo = EXCLUDED.como_ficou_sabendo, codigo_indicacao = EXCLUDED.codigo_indicacao
-                                """), {"p_id": pessoa_id, "est": est, "cid": cid, "sab": sab, "cod": cod, "dt": format_timestamp(f.get('creation_date'))})
+                                """), {"p_id": pessoa_id, "est": f.get('state'), "cid": f.get('city_name'), "sab": sab, "cod": cod, "dt": format_timestamp(f.get('creation_date'))})
 
                             # UPSERT LP2
                             if handler == "lp2":
@@ -190,11 +232,10 @@ def process():
                     except Exception as e:
                         print(f"[ERRO BANCO] ID {summary.get('id')}: {str(e)[:100]}")
                 
-                print(f"[{handler}] Página {offset}: {inscricoes_validas} Inscrições válidas. {cadastros_incompletos} Cadastros incompletos (ignorados).")
+                print(f"[{handler}] Página {offset}: {processados} Válidos atualizados. {ignorados} Lixos ignorados.")
                 offset += limit
-                time.sleep(0.5)
                 
-        print("\n--- VARREDURA FINALIZADA ---")
+        print("\n--- VARREDURA FINALIZADA COM SUCESSO ---")
 
 if __name__ == "__main__":
     process()
