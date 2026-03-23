@@ -5,9 +5,9 @@ on:
     - cron: '*/20 * * * *'
   workflow_dispatch:
   
-  concurrency:
-    group: sincronizacao-pipz
-    cancel-in-progress: false
+concurrency:
+  group: sincronizacao-pipz
+  cancel-in-progress: false
 
 jobs:
   build:
