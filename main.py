@@ -65,7 +65,7 @@ def get_contact_detail(contact_id):
     params = {"extra_fields": "1", "api_key": PIPZ_KEY, "api_secret": PIPZ_SECRET}
     res = requests.get(url, params=params, headers={"Accept": "application/json"})
     if res.status_code == 429:
-        time.sleep(10)
+        time.sleep(5)
     return res.json() if res.status_code == 200 else None
 
 def process():
@@ -73,13 +73,25 @@ def process():
     engine = create_engine(DB_URL)
     
     with engine.connect() as conn:
-        print(f"--- INICIANDO VARREDURA DE RECUPERAÇÃO: {datetime.now().strftime('%H:%M:%S')} ---")
+        print(f"--- INICIANDO VARREDURA EXTREMA: {datetime.now().strftime('%H:%M:%S')} ---")
+
+        # 1. AUTO-LIMPEZA DO BANCO
+        print("Limpando lixos e cadastros inválidos do banco...")
+        with conn.begin():
+            conn.execute(text("DELETE FROM form_gc.lp2_respostas WHERE trilha IS NULL OR TRIM(trilha) = ''"))
+            conn.execute(text("DELETE FROM form_gc.lp1_respostas WHERE pessoa_id IN (SELECT id FROM form_gc.pessoas WHERE cpf LIKE 'ID_%' OR LENGTH(cpf) < 11)"))
+            conn.execute(text("DELETE FROM form_gc.lp2_respostas WHERE pessoa_id IN (SELECT id FROM form_gc.pessoas WHERE cpf LIKE 'ID_%' OR LENGTH(cpf) < 11)"))
+            conn.execute(text("DELETE FROM form_gc.pessoas WHERE cpf LIKE 'ID_%' OR LENGTH(cpf) < 11"))
         
         # 2. CACHE EM MEMÓRIA DE PESSOAS VÁLIDAS
         print("Carregando e-mails que já estão prontos no banco...")
         lp1_ok = set(row[0] for row in conn.execute(text("SELECT p.email FROM form_gc.pessoas p JOIN form_gc.lp1_respostas r ON p.id = r.pessoa_id WHERE p.email IS NOT NULL")).fetchall())
         lp2_ok = set(row[0] for row in conn.execute(text("SELECT p.email FROM form_gc.pessoas p JOIN form_gc.lp2_respostas r ON p.id = r.pessoa_id WHERE p.email IS NOT NULL")).fetchall())
-        print(f"Cache pronto: {len(lp1_ok)} na LP1 | {len(lp2_ok)} na LP2\n")
+        
+        # ---> A CORREÇÃO MÁGICA FOI ADICIONADA AQUI <---
+        conn.commit() 
+        
+        print(f"Cache pronto: {len(lp1_ok)} concluíram LP1 | {len(lp2_ok)} concluíram LP2\n")
 
         for list_id, handler in [("141", "lp1"), ("144", "lp2")]:
             print(f"--- Sincronizando {handler.upper()} (Lista {list_id}) ---")
@@ -132,7 +144,6 @@ def process():
 
                     f = extract_fields_logic(summary)
                     
-                    # Ampliamos a busca do CPF para pegar todos os campos possíveis
                     raw_cpf = f.get("gc_2026_lp1_cpf") or f.get("gc_2026_lp2_cpf") or f.get("CPF") or f.get("cpf") or f.get("contact_custom_gc_2026_lp1_cpf") or f.get("document") or f.get("document_number")
                     nums_cpf = re.sub(r'\D', '', str(raw_cpf)) if raw_cpf else None
                     tri = f.get("gc_2026_lp2_trilha_educacional") or f.get("contact_custom_gc_2026_lp2_trilha_educacional")
@@ -148,21 +159,21 @@ def process():
                     raw_cpf = f.get("gc_2026_lp1_cpf") or f.get("gc_2026_lp2_cpf") or f.get("CPF") or f.get("cpf") or f.get("contact_custom_gc_2026_lp1_cpf") or f.get("document") or f.get("document_number")
                     nums_cpf = re.sub(r'\D', '', str(raw_cpf)) if raw_cpf else None
                     
-                    # Se mesmo pedindo detalhe ele não tem CPF, a gente aceita como ID_ para não perder a pessoa
+                    # Usa ID falso como salva-vidas, a gente só ignora no banco baseados na trilha/estado
                     final_cpf = nums_cpf[:11] if nums_cpf and len(nums_cpf) >= 11 else f"ID_{summary.get('id')}"
                     
                     if handler == "lp2":
                         tri = f.get("gc_2026_lp2_trilha_educacional") or f.get("contact_custom_gc_2026_lp2_trilha_educacional")
                         if not tri or str(tri).strip() == "":
                             ignorados += 1
-                            continue # Só barra da LP2 se a pessoa realmente não escolheu trilha
+                            continue 
                     
                     if handler == "lp1":
                         est = f.get('state')
                         cid = f.get('city_name')
                         if not est and not cid:
                             ignorados += 1
-                            continue # Caiu na lista mas não preencheu estado/cidade
+                            continue 
                             
                     processados += 1
 
